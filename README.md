@@ -1,5 +1,6 @@
 ### BUILD:
 
+    git clone https://github.com/2TheGalaxy/breaklock
     cd breaklock
     mkdir build
     cd build
