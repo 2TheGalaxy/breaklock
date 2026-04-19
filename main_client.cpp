@@ -1,6 +1,6 @@
 #define ASIO_STANDALONE
 #include <algorithm>
-#include <asio.hpp> // Zwykłe Asio z folderu include/
+#include <asio.hpp>
 #include <cstdlib>
 #include <ctime>
 #include <iostream>
@@ -12,6 +12,11 @@
 using asio::ip::tcp;
 using Combination = std::vector<int>;
 
+/**
+ * @brief Structure storing the history of sent queries.
+ * We keep the history of ALL queries (even from Phase 1) to ruthlessly 
+ * filter out invalid permutations in Phase 2.
+ */
 struct History
 {
   Combination query;
@@ -19,6 +24,9 @@ struct History
   int exact;
 };
 
+/**
+ * @brief Structure storing the decoded response from the server.
+ */
 struct Response
 {
   bool solved;
@@ -27,6 +35,9 @@ struct Response
   int attempts;
 };
 
+/**
+ * @brief Sends a "TRY" query with the given combination and parses the server's response.
+ */
 Response send_query(tcp::socket& socket, const Combination& query)
 {
   std::string msg = "TRY";
@@ -35,6 +46,7 @@ Response send_query(tcp::socket& socket, const Combination& query)
     msg += " " + std::to_string(x);
   }
   msg += "\n";
+
   asio::write(socket, asio::buffer(msg));
 
   asio::streambuf buf;
@@ -42,10 +54,12 @@ Response send_query(tcp::socket& socket, const Combination& query)
   std::istream is(&buf);
   std::string line;
   std::getline(is, line);
+
   if (!line.empty() && line.back() == '\r')
     line.pop_back();
 
   Response r = {false, 0, 0, 0};
+
   if (line.find("RESULT") == 0)
   {
     std::stringstream ss(line.substr(7));
@@ -56,7 +70,7 @@ Response send_query(tcp::socket& socket, const Combination& query)
     r.solved = true;
     std::stringstream ss(line.substr(7));
     ss >> r.attempts;
-    std::cout << "[ZWYCIESTWO] Rozwiazano w " << r.attempts << " probach!\n";
+    std::cout << "[VICTORY] Solved in " << r.attempts << " attempts!\n";
   }
   else if (line.find("ERROR") == 0)
   {
@@ -70,7 +84,7 @@ int main(int argc, char* argv[])
 {
   if (argc != 3)
   {
-    std::cerr << "Uzycie: " << argv[0] << " <host> <port>\n";
+    std::cerr << "Usage: " << argv[0] << " <host> <port>\n";
     return 1;
   }
 
@@ -84,7 +98,7 @@ int main(int argc, char* argv[])
     tcp::socket socket(io_context);
     asio::connect(socket, endpoints);
 
-    // Odczyt parametrów z serwera
+    // Read session header parameters from the server
     asio::streambuf buf;
     std::istream is(&buf);
     std::string line;
@@ -107,238 +121,195 @@ int main(int argc, char* argv[])
 
     if (n == 0)
     {
-      std::cerr << "Blad: Nie udalo sie wyciagnac LENGTH z serwera.\n";
+      std::cerr << "Error: Failed to extract LENGTH from the server.\n";
       return 1;
     }
 
-    std::cout << "[INFO] Gramy na planszy " << n << "x" << n << "\n";
+    std::cout << "[INFO] Playing on a " << n << "x" << n << " board\n";
 
+    // =================================================================
+    // WRAPPER: AUTOMATIC HISTORY TRACKING & EXIT ON WIN
+    // =================================================================
     std::vector<History> history;
-    std::vector<Combination> blocks(n);
 
-    // Budujemy n bloków o rozmiarze n
+    auto my_send_query = [&](const Combination& q)
+    {
+      auto res = send_query(socket, q);
+      if (res.solved)
+      {
+        exit(0); // Instantly terminate the program upon victory
+      }
+      history.push_back({q, res.hits, res.exact});
+      return res;
+    };
+
+    // =================================================================
+    // PHASE 1: FIND EXACTLY THE 10 CORRECT NUMBERS (DIVIDE & CONQUER)
+    // =================================================================
+    std::vector<Combination> blocks(n);
+    std::vector<int> H(n);
+    std::vector<int> known_zeros;
+
+    // 1A. Divide the 100 numbers into 10 blocks of 10. Query each block.
     for (int i = 0; i < n; ++i)
     {
       for (int j = 1; j <= n; ++j)
       {
         blocks[i].push_back(i * n + j);
       }
-    }
-
-    // --- FAZA 1: Zapytania rozłączne ---
-    std::vector<int> H(n);
-    for (int i = 0; i < n; ++i)
-    {
-      auto res = send_query(socket, blocks[i]);
-      if (res.solved)
-        return 0;
+      auto res = my_send_query(blocks[i]);
       H[i] = res.hits;
-      history.push_back({blocks[i], res.hits, res.exact});
+
+      // If a block has 0 hits, we just found 10 perfectly safe "zero/padding" numbers!
+      if (res.hits == 0 && known_zeros.empty())
+      {
+        known_zeros = blocks[i];
+      }
     }
 
-    std::vector<Combination> valid_sets;
-    Combination current_set(n);
-
-    // Rekurencyjne generowanie możliwych nieuporządkowanych setów
-    auto build_sets = [&](auto& self, int block_idx, int current_size) -> void
+    // 1B. Fallback: If no block had 0 hits, we find zeros through random sampling.
+    // Statistically, a random 10-number query on a 10x10 board has a ~34% chance
+    // of containing zero hits. This loop usually finishes in 2 to 4 queries.
+    while (known_zeros.empty())
     {
-      if (block_idx == n)
+      Combination q;
+      while ((int)q.size() < n)
       {
-        if (current_size == n)
-          valid_sets.push_back(current_set);
+        int r = (std::rand() % (n * n)) + 1;
+        if (std::find(q.begin(), q.end(), r) == q.end())
+          q.push_back(r);
+      }
+      auto res = my_send_query(q);
+      if (res.hits == 0)
+        known_zeros = q;
+    }
+
+    std::vector<int> true_numbers;
+
+    // 1C. Recursive Binary Search to extract exact hits from subsets.
+    // We pad subsets with our 'known_zeros' to isolate them and check exactly how many
+    // correct numbers reside within that specific subset.
+    auto extract_hits = [&](auto& self, const std::vector<int>& subset,
+                            int hits_in_subset) -> void
+    {
+      // Base Case 1: No correct numbers in this subset. Drop it.
+      if (hits_in_subset == 0)
+        return;
+
+      // Base Case 2: Every number in this subset is a hit. Save all of them!
+      if (hits_in_subset == (int)subset.size())
+      {
+        for (int x : subset)
+          true_numbers.push_back(x);
         return;
       }
-      int k = H[block_idx];
-      if (k == 0)
+
+      // Split the subset in half
+      int mid = subset.size() / 2;
+      std::vector<int> left(subset.begin(), subset.begin() + mid);
+      std::vector<int> right(subset.begin() + mid, subset.end());
+
+      // Query the left half, padded with known zeros to satisfy the length requirement 'n'
+      Combination q = left;
+      for (size_t i = 0; i < n - left.size(); ++i)
       {
-        self(self, block_idx + 1, current_size);
-        return;
+        q.push_back(known_zeros[i]);
       }
-      std::string bitmask(k, 1);
-      bitmask.resize(n, 0);
-      do
-      {
-        int added = 0;
-        for (int i = 0; i < n; ++i)
-        {
-          if (bitmask[i])
-          {
-            current_set[current_size + added] = blocks[block_idx][i];
-            added++;
-          }
-        }
-        self(self, block_idx + 1, current_size + k);
-      } while (std::prev_permutation(bitmask.begin(), bitmask.end()));
+
+      auto res = my_send_query(q);
+      int left_hits = res.hits;
+      int right_hits =
+          hits_in_subset - left_hits; // Math deduction saves us a query!
+
+      // Recurse deeper into both halves
+      self(self, left, left_hits);
+      self(self, right, right_hits);
     };
 
-    build_sets(build_sets, 0, 0);
-
-    // Filtrowanie setów, jeśli jest ich więcej niż 1
-    while (valid_sets.size() > 1)
+    // Execute the extraction process for every initial block that had > 0 hits
+    for (int i = 0; i < n; ++i)
     {
-      Combination best_query;
-      if (valid_sets.size() > 500)
-      {
-        best_query = valid_sets[std::rand() % valid_sets.size()];
-      }
-      else
-      {
-        int min_max_part = 1e9;
-        for (int i = 0; i < std::min(100, (int)valid_sets.size()); ++i)
-        {
-          const Combination& cand = valid_sets[i];
-          std::map<int, int> part_counts;
-          for (const auto& S : valid_sets)
-          {
-            int intersect = 0;
-            for (int x = 0; x < n; ++x)
-            {
-              for (int y = 0; y < n; ++y)
-              {
-                if (S[x] == cand[y])
-                {
-                  intersect++;
-                  break;
-                }
-              }
-            }
-            part_counts[intersect]++;
-          }
-          int max_part = 0;
-          for (auto const& [hits_count, cnt] : part_counts)
-            max_part = std::max(max_part, cnt);
-          if (max_part < min_max_part)
-          {
-            min_max_part = max_part;
-            best_query = cand;
-          }
-        }
-      }
-
-      auto res = send_query(socket, best_query);
-      if (res.solved)
-        return 0;
-      history.push_back({best_query, res.hits, res.exact});
-
-      std::vector<Combination> next_valid;
-      for (const auto& S : valid_sets)
-      {
-        int intersect = 0;
-        for (int x = 0; x < n; ++x)
-        {
-          for (int y = 0; y < n; ++y)
-          {
-            if (S[x] == best_query[y])
-            {
-              intersect++;
-              break;
-            }
-          }
-        }
-        if (intersect == res.hits)
-        {
-          next_valid.push_back(S);
-        }
-      }
-      valid_sets = std::move(next_valid);
+      extract_hits(extract_hits, blocks[i], H[i]);
     }
 
-    if (valid_sets.empty())
+    if ((int)true_numbers.size() != n)
     {
-      std::cerr << "Blad logiczny: brak mozliwych kombinacji.\n";
+      std::cerr << "Logic error: Expected " << n << " true numbers, but found "
+                << true_numbers.size() << "\n";
       return 1;
     }
 
-    // --- FAZA 2: Permutacje na wyselekcjonowanych cyfrach ---
-    Combination true_numbers = valid_sets[0];
-    std::vector<Combination> valid_perms;
+    // =================================================================
+    // PHASE 2: FIND THE EXACT PERMUTATION (LAZY MASTERMIND ALGORITHM)
+    // =================================================================
     Combination p = true_numbers;
-    std::sort(p.begin(), p.end());
+    std::sort(
+        p.begin(),
+        p.end()); // Crucial: required to initialize std::next_permutation properly
 
-    do
+    bool space_exhausted = false;
+
+    // Instead of holding 3.6 million permutations in a vector (which would crash/lag),
+    // we advance 'p' in-place. We evaluate each of the 10! permutations at most ONCE.
+    while (!space_exhausted)
     {
-      bool ok = true;
-      for (const auto& h : history)
+      bool ok = false;
+
+      // Scan the permutation space for the FIRST sequence that doesn't contradict
+      // the 'exact' match history we collected so far.
+      while (true)
       {
-        int exact = 0;
-        for (int i = 0; i < n; ++i)
+        ok = true;
+        for (const auto& h : history)
         {
-          if (p[i] == h.query[i])
-            exact++;
+          int exact = 0;
+          for (int i = 0; i < n; ++i)
+          {
+            if (p[i] == h.query[i])
+              exact++;
+          }
+
+          // If the permutation behaves differently regarding positional matches ('exact')
+          // compared to historical server feedback, it's definitively wrong.
+          if (exact != h.exact)
+          {
+            ok = false;
+            break;
+          }
         }
-        if (exact != h.exact)
+
+        // If it passes all historical checks, break the scan and shoot it at the server
+        if (ok)
+          break;
+
+        // Advance to the next lexicographical permutation. If it wraps around to false, we checked them all.
+        if (!std::next_permutation(p.begin(), p.end()))
         {
-          ok = false;
+          space_exhausted = true;
           break;
         }
       }
-      if (ok)
-        valid_perms.push_back(p);
-    } while (std::next_permutation(p.begin(), p.end()));
 
-    while (valid_perms.size() > 1)
-    {
-      Combination best_query;
-      if (valid_perms.size() > 500)
+      if (space_exhausted && !ok)
       {
-        best_query = valid_perms[std::rand() % valid_perms.size()];
-      }
-      else
-      {
-        int min_max_part = 1e9;
-        for (int i = 0; i < std::min(150, (int)valid_perms.size()); ++i)
-        {
-          const Combination& cand = valid_perms[i];
-          std::map<int, int> part_counts;
-          for (const auto& P : valid_perms)
-          {
-            int exact = 0;
-            for (int j = 0; j < n; ++j)
-            {
-              if (P[j] == cand[j])
-                exact++;
-            }
-            part_counts[exact]++;
-          }
-          int max_part = 0;
-          for (auto const& [exact_count, cnt] : part_counts)
-            max_part = std::max(max_part, cnt);
-          if (max_part < min_max_part)
-          {
-            min_max_part = max_part;
-            best_query = cand;
-          }
-        }
+        std::cerr << "Error: Search space exhausted with no consistent "
+                     "permutation found.\n";
+        return 1;
       }
 
-      auto res = send_query(socket, best_query);
-      if (res.solved)
-        return 0;
-      history.push_back({best_query, res.hits, res.exact});
+      // Shoot the valid permutation. If it's the right one, my_send_query calls exit(0).
+      my_send_query(p);
 
-      std::vector<Combination> next_perms;
-      for (const auto& P : valid_perms)
+      // If it wasn't the solution, advance the permutation state by one so we don't re-test it next cycle.
+      if (!std::next_permutation(p.begin(), p.end()))
       {
-        int exact = 0;
-        for (int j = 0; j < n; ++j)
-        {
-          if (P[j] == best_query[j])
-            exact++;
-        }
-        if (exact == res.exact)
-          next_perms.push_back(P);
+        space_exhausted = true;
       }
-      valid_perms = std::move(next_perms);
-    }
-
-    if (!valid_perms.empty())
-    {
-      send_query(socket, valid_perms[0]);
     }
   }
   catch (std::exception& e)
   {
-    std::cerr << "Wyjatek: " << e.what() << "\n";
+    std::cerr << "Exception caught: " << e.what() << "\n";
   }
 
   return 0;
